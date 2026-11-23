@@ -9,6 +9,15 @@
 // card is built once and reused. No state is kept between run() calls: every
 // cache is created fresh inside run(), so each case is answered alone.
 //
+// Round 2: templates whose output depends only on run-constant values
+// (site, tags, recent) are rendered once per run() and reused; templates
+// depending on one extra object (a page, a card, a pager) are cached by
+// that object's identity. Free-root analysis runs transitively through
+// includes, with a cycle taint so cyclic templates are never memoised.
+// wordsOf counts with a Uint8 whitespace table instead of a per-character
+// predicate, and resolvePath takes a fast path when the relative path has
+// no '.' and no '//' and does not end in '/'.
+//
 // Dependency-free ES module. Node 22.
 
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -550,6 +559,62 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
+const RUN_CONSTANTS = new Set(['site', 'tags', 'recent']);
+
+/** Root names a template reads, transitively through includes, not bound inside it.
+ *  '\\0cycle' marks a template whose include graph cycles (not memoizable). */
+function computeFree(name, templates, freeCache, visiting) {
+  if (freeCache.has(name)) return freeCache.get(name);
+  if (visiting.has(name)) return new Set(['\0cycle']);
+  const nodes = templates.get(name);
+  if (nodes === undefined) return new Set();
+  visiting.add(name);
+  const free = new Set();
+  const walk = (ns, bound) => {
+    for (const n of ns) {
+      if (n.kind === 'var' || n.kind === 'raw') {
+        if (!bound.has(n.path[0])) free.add(n.path[0]);
+      } else if (n.kind === 'if') {
+        if (!bound.has(n.path[0])) free.add(n.path[0]);
+        walk(n.then, bound);
+        if (n.else !== null) walk(n.else, bound);
+      } else if (n.kind === 'for') {
+        if (!bound.has(n.path[0])) free.add(n.path[0]);
+        const b2 = new Set(bound);
+        b2.add(n.name);
+        b2.add('loop');
+        walk(n.body, b2);
+      } else if (n.kind === 'include') {
+        const sub = computeFree(n.name, templates, freeCache, visiting);
+        for (const x of sub) if (!bound.has(x)) free.add(x);
+      }
+    }
+  };
+  walk(nodes, new Set());
+  visiting.delete(name);
+  freeCache.set(name, free);
+  return free;
+}
+
+/** How an include of this template may be memoised, or null. */
+function memoKind(free) {
+  if (free.has('\0cycle') || free.has('loop')) return null;
+  const extra = [];
+  for (const x of free) if (!RUN_CONSTANTS.has(x)) extra.push(x);
+  if (extra.length === 0) return { kind: 'const' };
+  if (extra.length === 1) return { kind: 'obj', name: extra[0] };
+  return null;
+}
+
+/** Whether a for-loop scope shadows one of the run-constant names. */
+function shadowsConstants(scope) {
+  for (let s = 1; s < scope.length; s++) {
+    const vars = scope[s];
+    if (Object.hasOwn(vars, 'site') || Object.hasOwn(vars, 'tags') || Object.hasOwn(vars, 'recent')) return true;
+  }
+  return false;
+}
+
 /** The value at `path` in the scope stack (innermost first). */
 function lookup(scope, path) {
   for (let s = scope.length - 1; s >= 0; s--) {
@@ -618,7 +683,39 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < 8) renderNodes(t, scope, ctx, depth + 1, out);
+        if (t === undefined || depth >= 8) break;
+        const mk = ctx.memoKinds.get(n.name);
+        if (mk !== undefined && mk !== null && depth <= 3 && !shadowsConstants(scope)) {
+          if (mk.kind === 'const') {
+            let hit = ctx.constCache.get(n.name);
+            if (hit === undefined) {
+              const tmp = [];
+              renderNodes(t, scope, ctx, depth + 1, tmp);
+              hit = tmp.join('');
+              ctx.constCache.set(n.name, hit);
+            }
+            out.push(hit);
+            break;
+          }
+          const v = lookup(scope, [mk.name]);
+          if (v !== null && typeof v === 'object') {
+            let per = ctx.objCache.get(v);
+            if (per === undefined) {
+              per = new Map();
+              ctx.objCache.set(v, per);
+            }
+            let hit = per.get(n.name);
+            if (hit === undefined) {
+              const tmp = [];
+              renderNodes(t, scope, ctx, depth + 1, tmp);
+              hit = tmp.join('');
+              per.set(n.name, hit);
+            }
+            out.push(hit);
+            break;
+          }
+        }
+        renderNodes(t, scope, ctx, depth + 1, out);
         break;
       }
     }
@@ -640,20 +737,26 @@ function isWS(c) {
   );
 }
 
+const WS_TABLE = new Uint8Array(65536);
+for (const _c of [32, 9, 10, 11, 12, 13, 160, 5760, 8232, 8233, 8239, 8287, 12288, 65279]) WS_TABLE[_c] = 1;
+for (let _c = 8192; _c <= 8202; _c++) WS_TABLE[_c] = 1;
 function wordsOf(text) {
   let n = 0;
   let i = 0;
   const len = text.length;
   while (i < len) {
-    while (i < len && isWS(text.charCodeAt(i))) i++;
+    while (i < len && WS_TABLE[text.charCodeAt(i)]) i++;
     if (i >= len) break;
     n++;
-    while (i < len && !isWS(text.charCodeAt(i))) i++;
+    while (i < len && !WS_TABLE[text.charCodeAt(i)]) i++;
   }
   return n;
 }
 
 function resolvePath(dir, rel) {
+  if (rel.indexOf('.') === -1 && rel.indexOf('//') === -1 && rel.charCodeAt(rel.length - 1) !== 47) {
+    return dir === '' ? rel : `${dir}/${rel}`;
+  }
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -868,7 +971,10 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cardOf(p));
-  const ctx = { templates, escape: escapeHtml };
+  const freeCache = new Map();
+  const memoKinds = new Map();
+  for (const name of templates.keys()) memoKinds.set(name, memoKind(computeFree(name, templates, freeCache, new Set())));
+  const ctx = { templates, escape: escapeHtml, memoKinds, constCache: new Map(), objCache: new Map() };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
